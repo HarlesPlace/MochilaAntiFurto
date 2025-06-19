@@ -7,6 +7,7 @@
 #include "freertos/queue.h" // usar barra de fila para comunicação entre tarefas
 #include "freertos/event_groups.h" // usar barra de eventos para sinalização de eventos
 #include "esp_system.h" // usar barra de sistema para funções do sistema
+#include <math.h> // usar barra de matemática para cálculos matemáticos
 
 // I2C pins
 #define I2C_SDA GPIO_NUM_21  // I2C SDA pin
@@ -16,11 +17,24 @@
 #define MPU6050_ADDR  0x68
 #define MPU6050_ACCEL_XOUT_H 0x3B
 
+// Movement detection parameters
+#define DELTA_THRESHOLD 0.2f //  Threshold for aceleration change 
+#define MONITORAMENTO_DURACAO_MS 10000 // time of monitoring duration [ms]
+#define CHECK_INTERVAL_MS 100 // Interval between checks [ms]
+#define TOTAL_LEITURAS (MONITORAMENTO_DURACAO_MS / CHECK_INTERVAL_MS) // Total number of readings during monitoring
+#define FRACAO_MINIMA_MOVIMENTO 0.6f  // porcentual mínimo de leituras que devem indicar movimento para considerar que houve movimento 
+
 // Structure to hold IMU readings
 typedef struct {
     float acc_x, acc_y, acc_z;
     float gyro_x, gyro_y, gyro_z;
 } mpu6050_data_t;
+
+// State machine for movement detection
+typedef enum {
+    EM_REPOUSO,
+    MONITORANDO_MOVIMENTO
+} estado_movimento_t;
 
 mpu6050_data_t imu_data = {0}; // Global variable to hold IMU data
 static const char *TAG = "MochilaAntiFurto"; 
@@ -65,7 +79,7 @@ void mpu6050_calibrate(int samples) {
 
         sum_ax += ax;
         sum_ay += ay;
-        sum_az += az - 16384; // Subtract 1g on Z
+        sum_az += az; //- 16384; // Subtract 1g on Z
         sum_gx += gx;
         sum_gy += gy;
         sum_gz += gz;
@@ -91,20 +105,76 @@ mpu6050_data_t mpu6050_read() {
         ESP_LOGE(TAG, "MPU6050 read failed: %s", esp_err_to_name(ret));
         return sensor_data;
     }
+
     sensor_data.acc_x = ((int16_t)(data[0] << 8 | data[1]) / 16384.0) - acc_offset_x;
     sensor_data.acc_y = ((int16_t)(data[2] << 8 | data[3]) / 16384.0) - acc_offset_y;
     sensor_data.acc_z = ((int16_t)(data[4] << 8 | data[5]) / 16384.0) - acc_offset_z;
     sensor_data.gyro_x = ((int16_t)(data[8] << 8 | data[9]) / 131.0) - gyro_offset_x;
     sensor_data.gyro_y = ((int16_t)(data[10] << 8 | data[11]) / 131.0) - gyro_offset_y;
     sensor_data.gyro_z = ((int16_t)(data[12] << 8 | data[13]) / 131.0) - gyro_offset_z;
+
     return sensor_data;
 }
 
 // Task to periodically read IMU data
 void acelerometer_task(void *arg) {
+    float last_x = 0, last_y = 0, last_z = 0;
+    bool first_reading = true;
+    float delta = 0.0f;
+    estado_movimento_t estado = EM_REPOUSO;
+
+    int contador_leituras = 0;
+    int contador_movimento = 0;
     while (1) {
         imu_data = mpu6050_read();
-        vTaskDelay(pdMS_TO_TICKS(50));
+
+        float acc_x = imu_data.acc_x;
+        float acc_y = imu_data.acc_y;
+        float acc_z = imu_data.acc_z;
+
+        if (!first_reading) {
+            delta = sqrtf(
+                powf(acc_x - last_x, 2) +
+                powf(acc_y - last_y, 2) +
+                powf(acc_z - last_z, 2)
+            );
+        }
+
+        first_reading = false;
+
+        switch (estado) {
+            case EM_REPOUSO:
+                if (delta > DELTA_THRESHOLD) {
+                    estado = MONITORANDO_MOVIMENTO;
+                    contador_leituras = 1;
+                    contador_movimento = 1;
+                    ESP_LOGI(TAG, "Início de possível movimento (Δ=%.4f)", delta);
+                }
+                break;
+
+            case MONITORANDO_MOVIMENTO:
+                contador_leituras++;
+                if (delta > DELTA_THRESHOLD) {
+                    contador_movimento++;
+                }
+                if (contador_leituras >= TOTAL_LEITURAS) {
+                    float proporcao = (float)contador_movimento / contador_leituras;
+                    if (proporcao >= FRACAO_MINIMA_MOVIMENTO) {
+                        ESP_LOGW(TAG, "Movimento suspeito detectado! Δ (%d/%d)", contador_movimento, contador_leituras);
+                        // Acione alarme aqui
+                    } else {
+                        ESP_LOGI(TAG, "Movimento descartado. Δ (%d/%d)", contador_movimento, contador_leituras);
+                    }
+                    estado = EM_REPOUSO;
+                }
+                break;
+            }
+       
+        last_x = acc_x;
+        last_y = acc_y;
+        last_z = acc_z;
+
+        vTaskDelay(pdMS_TO_TICKS(CHECK_INTERVAL_MS));
     }
 }
 
