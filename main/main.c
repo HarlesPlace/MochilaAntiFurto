@@ -8,6 +8,8 @@
 #include "freertos/event_groups.h" // usar barra de eventos para sinalização de eventos
 #include "esp_system.h" // usar barra de sistema para funções do sistema
 #include <math.h> // usar barra de matemática para cálculos matemáticos
+#include "driver/uart.h" // usar barra de uart para comunicação serial
+#include "minmea.h" // parser de GPS NMEA
 
 // I2C pins
 #define I2C_SDA GPIO_NUM_21  // I2C SDA pin
@@ -23,6 +25,12 @@
 #define CHECK_INTERVAL_MS 100 // Interval between checks [ms]
 #define TOTAL_LEITURAS (MONITORAMENTO_DURACAO_MS / CHECK_INTERVAL_MS) // Total number of readings during monitoring
 #define FRACAO_MINIMA_MOVIMENTO 0.6f  // porcentual mínimo de leituras que devem indicar movimento para considerar que houve movimento 
+
+// GPS UART configuration
+#define GPS_UART_PORT      UART_NUM_1
+#define GPS_TXD_PIN        (GPIO_NUM_17) 
+#define GPS_RXD_PIN        (GPIO_NUM_16) 
+#define GPS_BAUD_RATE      9600
 
 // Structure to hold IMU readings
 typedef struct {
@@ -178,11 +186,26 @@ void acelerometer_task(void *arg) {
     }
 }
 
+void gps_init() {
+    const uart_config_t uart_config = {
+        .baud_rate = GPS_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+
+    uart_driver_install(GPS_UART_PORT, 1024 * 2, 0, 0, NULL, 0);
+    uart_param_config(GPS_UART_PORT, &uart_config);
+    uart_set_pin(GPS_UART_PORT, GPS_TXD_PIN, GPS_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
 void  app_main(){
     i2c_master_init(); 
     ESP_LOGI(TAG, "i2c Master initialized");
     mpu6050_init();
     mpu6050_calibrate(100);  // Calibrate IMU
+    gps_init();
 
     xTaskCreate(acelerometer_task, "acelerometer_task", 4096, NULL, 5, NULL); 
     ESP_LOGI(TAG, "Acelerometer task started");
