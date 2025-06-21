@@ -27,10 +27,16 @@
 #define FRACAO_MINIMA_MOVIMENTO 0.6f  // porcentual mínimo de leituras que devem indicar movimento para considerar que houve movimento 
 
 // GPS UART configuration
-#define GPS_UART_PORT      UART_NUM_1
+#define GPS_UART_PORT      UART_NUM_2
 #define GPS_TXD_PIN        (GPIO_NUM_17) 
 #define GPS_RXD_PIN        (GPIO_NUM_16) 
 #define GPS_BAUD_RATE      9600
+
+// GSM UART configuration
+#define GSM_TXD            GPIO_NUM_10
+#define GSM_RXD            GPIO_NUM_9
+#define GSM_UART           UART_NUM_1
+#define GSM_BAUD           9600
 
 // Structure to hold IMU readings
 typedef struct {
@@ -187,7 +193,7 @@ void acelerometer_task(void *arg) {
 }
 
 void gps_init() {
-    const uart_config_t uart_config = {
+    const uart_config_t gps_config = {
         .baud_rate = GPS_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
@@ -196,8 +202,22 @@ void gps_init() {
     };
 
     uart_driver_install(GPS_UART_PORT, 1024 * 2, 0, 0, NULL, 0);
-    uart_param_config(GPS_UART_PORT, &uart_config);
+    uart_param_config(GPS_UART_PORT, &gps_config);
     uart_set_pin(GPS_UART_PORT, GPS_TXD_PIN, GPS_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
+void gsm_init() {
+    const uart_config_t gsm_config = {
+        .baud_rate = GSM_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+
+    uart_driver_install(GSM_UART, 2048, 0, 0, NULL, 0);
+    uart_param_config(GSM_UART, &gsm_config);
+    uart_set_pin(GSM_UART, GSM_TXD, GSM_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
 void  app_main(){
@@ -206,6 +226,7 @@ void  app_main(){
     mpu6050_init();
     mpu6050_calibrate(100);  // Calibrate IMU
     gps_init();
+    gsm_init();
 
     xTaskCreate(acelerometer_task, "acelerometer_task", 4096, NULL, 5, NULL); 
     ESP_LOGI(TAG, "Acelerometer task started");
