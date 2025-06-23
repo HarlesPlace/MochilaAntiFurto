@@ -19,7 +19,10 @@ Sistema embarcado para monitoramento de movimentação via acelerômetro MPU6050
 - ESP32 DevKit v1 (38 pinos)
 - Sensor acelerômetro e giroscópio MPU6050 conectado via I2C (GPIO 21 - SDA, GPIO 22 - SCL)
 - Módulo GPS NEO-6M conectado via UART2 (GPIO 16 - TX, GPIO 17 - RX)
-- (Opcional) Módulo GSM via UART1
+- Módulo GSM via UART1 (GPIO 10 - TX, GPIO 09 - RX)
+- 2 botões
+- Sensor Reed Switch
+- 1 buzzer
 
 ---
 
@@ -31,8 +34,12 @@ Sistema embarcado para monitoramento de movimentação via acelerômetro MPU6050
 | MPU6050    | SCL      | GPIO 22    |
 | GPS NEO-6M | TX       | GPIO 16    |
 | GPS NEO-6M | RX       | GPIO 17    |
-| GSM        | TX       | UART1 TX   |
-| GSM        | RX       | UART1 RX   |
+| GSM        | TX       | GPIO 10    |
+| GSM        | RX       | GPIO 09    |
+| Botão      | -        | GPIO 18    |
+| Botão      | -        | GPIO 19    |
+| Reed Switch | -       | GPIO 23    |
+| Buzzer     | -        | GPIO 25    |
 
 ---
 
