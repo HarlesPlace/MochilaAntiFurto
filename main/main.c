@@ -1,4 +1,5 @@
 #include <stdio.h> // incluir biblioteca de entrada e saída padrão
+#include <string.h> // incluir biblioteca de manipulação de strings
 #include "driver/i2c.h" // usar barra de i2c para leitura de sensores
 #include "driver/gpio.h" // usar barra de gpio para controle de pinos
 #include "esp_log.h" // usar barra de log para mensagens de depuração
@@ -42,6 +43,12 @@
 #define BTN_EMERGENCIA GPIO_NUM_18
 #define BTN_ANTIFURTO  GPIO_NUM_19
 
+// Reed switch GPIO configuration
+#define REED_SWITCH    GPIO_NUM_23
+
+// Buzzer GPIO configuration
+#define BUZZER         GPIO_NUM_25
+
 // Structure to hold IMU readings
 typedef struct {
     float acc_x, acc_y, acc_z;
@@ -67,10 +74,14 @@ static const char *TAG = "MochilaAntiFurto";
 float acc_offset_x = 0, acc_offset_y = 0, acc_offset_z = 0; // Calibration offsets for accelerometer
 float gyro_offset_x = 0, gyro_offset_y = 0, gyro_offset_z = 0; // Calibration offsets for gyroscope
 estado_global_t estado_global = AWAIT;
+char gps_position[100] = "Position inconnue";
 
 // Protótipos
 static void IRAM_ATTR btn_emerg_isr_handler(void *arg);
 static void IRAM_ATTR btn_antifurto_isr_handler(void *arg);
+void send_sms(const char *message);
+void buzzer_on();
+void buzzer_off();
 
 // Initialize I2C master for sensors
 void i2c_master_init() {
@@ -223,6 +234,34 @@ void gps_init() {
     uart_set_pin(GPS_UART_PORT, GPS_TXD_PIN, GPS_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
+// Task to read GPS data and parse sentences
+void gps_task(void *arg) {
+    uint8_t data[128];
+    char line[128];
+    int pos = 0;
+
+    while (1) {
+        int len = uart_read_bytes(GPS_UART_PORT, data, sizeof(data) - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            for (int i = 0; i < len; i++) {
+                if (data[i] == '\n') {
+                    line[pos] = '\0';
+                    struct minmea_sentence_gga frame;
+                    if (minmea_parse_gga(&frame, line)) {
+                        snprintf(gps_position, sizeof(gps_position), "Lat: %.5f, Lon: %.5f",
+                                 minmea_tofloat(&frame.latitude),
+                                 minmea_tofloat(&frame.longitude));
+                        ESP_LOGI(TAG, "GPS %s", gps_position);
+                    }
+                    pos = 0;
+                } else if (pos < sizeof(line) - 1) {
+                    line[pos++] = data[i];
+                }
+            }
+        }
+    }
+}
+
 void gsm_init() {
     const uart_config_t gsm_config = {
         .baud_rate = GSM_BAUD,
@@ -237,12 +276,43 @@ void gsm_init() {
     uart_set_pin(GSM_UART, GSM_TXD, GSM_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
+// Function to send SMS using GSM module
+void send_sms(const char *message) {
+    const char *numero = "\"+336XXXXXXXX\"";  // Ton numéro ici
+    char cmd[100];
+
+    uart_write_bytes(GSM_UART, "AT\r", 3);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    snprintf(cmd, sizeof(cmd), "AT+CMGF=1\r");
+    uart_write_bytes(GSM_UART, cmd, strlen(cmd));
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    snprintf(cmd, sizeof(cmd), "AT+CMGS=%s\r", numero);
+    uart_write_bytes(GSM_UART, cmd, strlen(cmd));
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    uart_write_bytes(GSM_UART, message, strlen(message));
+    uart_write_bytes(GSM_UART, "\x1A", 1);
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    ESP_LOGI(TAG, "SMS envoyé : %s", message);
+}
+
+void buzzer_on() {
+    gpio_set_level(BUZZER, 1);
+}
+
+void buzzer_off() {
+    gpio_set_level(BUZZER, 0);
+}
+
 // detecta pressionamento dos botões por interrupção 
 void botoes_init() {
     gpio_config_t io_conf = {
         .intr_type = GPIO_INTR_NEGEDGE, // detecta borda de descida
         .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << BTN_EMERGENCIA) | (1ULL << BTN_ANTIFURTO),
+        .pin_bit_mask = (1ULL << BTN_EMERGENCIA) | (1ULL << BTN_ANTIFURTO) | (1ULL << REED_SWITCH),
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE
     };
@@ -252,25 +322,45 @@ void botoes_init() {
     gpio_install_isr_service(0);
     gpio_isr_handler_add(BTN_EMERGENCIA, btn_emerg_isr_handler, NULL);
     gpio_isr_handler_add(BTN_ANTIFURTO, btn_antifurto_isr_handler, NULL);
+
+    gpio_set_direction(BUZZER, GPIO_MODE_OUTPUT);
 }
 
 // trata interrupção no botão de emergencia
 static void IRAM_ATTR btn_emerg_isr_handler(void *arg) {
-    if (estado_global == AWAIT){
-        estado_global = EMERGENCY_MODE;
-    }
-    else{
-        estado_global = AWAIT;
-    }
+    estado_global = (estado_global == AWAIT) ? EMERGENCY_MODE : AWAIT;
 }
 
 // trata interrupção no botão de anti furto
 static void IRAM_ATTR btn_antifurto_isr_handler(void *arg) {
-    if (estado_global == AWAIT){
-        estado_global = ANTI_THEFT_MODE;
+   estado_global = (estado_global == AWAIT) ? ANTI_THEFT_MODE : AWAIT;
+}
+
+void antifurto_task(void *arg) {
+    while (1) {
+        if (estado_global == ANTI_THEFT_MODE) {
+            if (gpio_get_level(REED_SWITCH) == 0) { // Ouverture détectée
+                ESP_LOGW(TAG, "Ouverture détectée !");
+                send_sms("Alerte ouverture zipp !");
+                buzzer_on();
+                estado_global = ALARMING;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
-    else{
-        estado_global = AWAIT;
+}
+
+void emergencia_task(void *arg) {
+    while (1) {
+        if (estado_global == EMERGENCY_MODE) {
+            send_sms(gps_position);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            buzzer_on();
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            buzzer_off();
+            estado_global = ALARMING;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -283,7 +373,10 @@ void  app_main(){
     gsm_init();
     botoes_init();
 
+    xTaskCreate(gps_task, "gps_task", 4096, NULL, 5, NULL);
+    xTaskCreate(antifurto_task, "antifurto_task", 2048, NULL, 5, NULL);
+    xTaskCreate(emergencia_task, "emergencia_task", 2048, NULL, 5, NULL);
     xTaskCreate(acelerometer_task, "acelerometer_task", 4096, NULL, 5, NULL); 
-    ESP_LOGI(TAG, "Acelerometer task started");
-
+    
+    ESP_LOGI(TAG, "Système prêt");
 }
