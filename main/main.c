@@ -38,6 +38,10 @@
 #define GSM_UART           UART_NUM_1
 #define GSM_BAUD           9600
 
+// Button GPIOs configuration
+#define BTN_EMERGENCIA GPIO_NUM_18
+#define BTN_ANTIFURTO  GPIO_NUM_19
+
 // Structure to hold IMU readings
 typedef struct {
     float acc_x, acc_y, acc_z;
@@ -50,10 +54,23 @@ typedef enum {
     MONITORANDO_MOVIMENTO
 } estado_movimento_t;
 
+// State machine for global operation
+typedef enum {
+    AWAIT,
+    EMERGENCY_MODE,
+    ANTI_THEFT_MODE,
+    ALARMING
+} estado_global_t;
+
 mpu6050_data_t imu_data = {0}; // Global variable to hold IMU data
 static const char *TAG = "MochilaAntiFurto"; 
 float acc_offset_x = 0, acc_offset_y = 0, acc_offset_z = 0; // Calibration offsets for accelerometer
 float gyro_offset_x = 0, gyro_offset_y = 0, gyro_offset_z = 0; // Calibration offsets for gyroscope
+estado_global_t estado_global = AWAIT;
+
+// Protótipos
+static void IRAM_ATTR btn_emerg_isr_handler(void *arg);
+static void IRAM_ATTR btn_antifurto_isr_handler(void *arg);
 
 // Initialize I2C master for sensors
 void i2c_master_init() {
@@ -220,6 +237,43 @@ void gsm_init() {
     uart_set_pin(GSM_UART, GSM_TXD, GSM_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
+// detecta pressionamento dos botões por interrupção 
+void botoes_init() {
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_NEGEDGE, // detecta borda de descida
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BTN_EMERGENCIA) | (1ULL << BTN_ANTIFURTO),
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE
+    };
+    gpio_config(&io_conf);
+
+    // Instala serviço de interrupção
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BTN_EMERGENCIA, btn_emerg_isr_handler, NULL);
+    gpio_isr_handler_add(BTN_ANTIFURTO, btn_antifurto_isr_handler, NULL);
+}
+
+// trata interrupção no botão de emergencia
+static void IRAM_ATTR btn_emerg_isr_handler(void *arg) {
+    if (estado_global == AWAIT){
+        estado_global = EMERGENCY_MODE;
+    }
+    else{
+        estado_global = AWAIT;
+    }
+}
+
+// trata interrupção no botão de anti furto
+static void IRAM_ATTR btn_antifurto_isr_handler(void *arg) {
+    if (estado_global == AWAIT){
+        estado_global = ANTI_THEFT_MODE;
+    }
+    else{
+        estado_global = AWAIT;
+    }
+}
+
 void  app_main(){
     i2c_master_init(); 
     ESP_LOGI(TAG, "i2c Master initialized");
@@ -227,6 +281,7 @@ void  app_main(){
     mpu6050_calibrate(100);  // Calibrate IMU
     gps_init();
     gsm_init();
+    botoes_init();
 
     xTaskCreate(acelerometer_task, "acelerometer_task", 4096, NULL, 5, NULL); 
     ESP_LOGI(TAG, "Acelerometer task started");

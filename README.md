@@ -1,4 +1,5 @@
 # Mochila Antifurto com ESP32
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 Sistema embarcado para monitoramento de movimentação via acelerômetro MPU6050 e rastreamento por GPS NEO-6M, com comunicação via GSM.
 
