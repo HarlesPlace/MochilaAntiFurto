@@ -53,15 +53,11 @@ cd mochila-antifurto
 ```
 3. Configure o alvo para ESP32:
 ```bash
-Copiar
-Editar
 idf.py set-target esp32
 ```
 4. Compile e grave:
 
 ```bash
-Copiar
-Editar
 idf.py build
 idf.py flash
 idf.py monitor

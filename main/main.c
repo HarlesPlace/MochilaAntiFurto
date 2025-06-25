@@ -49,6 +49,9 @@
 // Buzzer GPIO configuration
 #define BUZZER         GPIO_NUM_25
 
+// Phone number to send SMS
+#define TELEFONE_NUMBER "\"+5511939069320\""
+
 // Structure to hold IMU readings
 typedef struct {
     float acc_x, acc_y, acc_z;
@@ -75,6 +78,7 @@ float acc_offset_x = 0, acc_offset_y = 0, acc_offset_z = 0; // Calibration offse
 float gyro_offset_x = 0, gyro_offset_y = 0, gyro_offset_z = 0; // Calibration offsets for gyroscope
 estado_global_t estado_global = AWAIT;
 char gps_position[100] = "Position inconnue";
+bool volatile mouvement_detecte = false; // Flag to indicate if movement is detected
 
 // Protótipos
 static void IRAM_ATTR btn_emerg_isr_handler(void *arg);
@@ -203,9 +207,10 @@ void acelerometer_task(void *arg) {
                     float proporcao = (float)contador_movimento / contador_leituras;
                     if (proporcao >= FRACAO_MINIMA_MOVIMENTO) {
                         ESP_LOGW(TAG, "Movimento suspeito detectado! Δ (%d/%d)", contador_movimento, contador_leituras);
-                        // Acione alarme aqui
+                        mouvement_detecte = true;
                     } else {
                         ESP_LOGI(TAG, "Movimento descartado. Δ (%d/%d)", contador_movimento, contador_leituras);
+                        mouvement_detecte = false;
                     }
                     estado = EM_REPOUSO;
                 }
@@ -244,21 +249,38 @@ void gps_task(void *arg) {
         int len = uart_read_bytes(GPS_UART_PORT, data, sizeof(data) - 1, pdMS_TO_TICKS(100));
         if (len > 0) {
             for (int i = 0; i < len; i++) {
-                if (data[i] == '\n') {
-                    line[pos] = '\0';
-                    struct minmea_sentence_gga frame;
-                    if (minmea_parse_gga(&frame, line)) {
-                        snprintf(gps_position, sizeof(gps_position), "Lat: %.5f, Lon: %.5f",
-                                 minmea_tofloat(&frame.latitude),
-                                 minmea_tofloat(&frame.longitude));
-                        ESP_LOGI(TAG, "GPS %s", gps_position);
+                char c = data[i];
+                // Trata linhas completas
+                if (c == '\n' || c == '\r') {
+                    if (pos == 0) continue;  // ignora quebras duplicadas
+
+                    line[pos] = '\0';  // finaliza a string
+                    ESP_LOGI(TAG, "NMEA: %s", line);
+
+                    // Verifica se é uma sentença GGA
+                    if (minmea_sentence_id(line, false) == MINMEA_SENTENCE_GGA) {
+                        struct minmea_sentence_gga frame;
+                        if (minmea_parse_gga(&frame, line)) {
+                            if (frame.fix_quality > 0) {
+                                float lat = minmea_tofloat(&frame.latitude);
+                                float lon = minmea_tofloat(&frame.longitude);
+                                ESP_LOGI(TAG, "Localização: Lat: %.5f, Lon: %.5f", lat, lon);
+                            } else {
+                                ESP_LOGW(TAG, "Sem fix GPS (fix_quality = %d)", frame.fix_quality);
+                            }
+                        } else {
+                            ESP_LOGW(TAG, "Falha ao parsear GGA");
+                        }
                     }
-                    pos = 0;
-                } else if (pos < sizeof(line) - 1) {
-                    line[pos++] = data[i];
+                    pos = 0;  // reinicia leitura da próxima sentença
+                }
+                // Armazena caracteres válidos
+                else if (pos < sizeof(line) - 1 && (c >= 32 && c <= 126)) {
+                    line[pos++] = c;
                 }
             }
         }
+        vTaskDelay(pdMS_TO_TICKS(10));  // pequena pausa para cooperatividade
     }
 }
 
@@ -278,7 +300,7 @@ void gsm_init() {
 
 // Function to send SMS using GSM module
 void send_sms(const char *message) {
-    const char *numero = "\"+336XXXXXXXX\"";  // Ton numéro ici
+    const char *numero = TELEFONE_NUMBER;  // Ton numéro ici
     char cmd[100];
 
     uart_write_bytes(GSM_UART, "AT\r", 3);
@@ -310,73 +332,115 @@ void buzzer_off() {
 // detecta pressionamento dos botões por interrupção 
 void botoes_init() {
     gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_NEGEDGE, // detecta borda de descida
+        .intr_type = GPIO_INTR_DISABLE,  // PAS d'interruption
         .mode = GPIO_MODE_INPUT,
         .pin_bit_mask = (1ULL << BTN_EMERGENCIA) | (1ULL << BTN_ANTIFURTO) | (1ULL << REED_SWITCH),
-        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE,  // bouton connecté à GND + pullup
         .pull_down_en = GPIO_PULLDOWN_DISABLE
     };
     gpio_config(&io_conf);
 
-    // Instala serviço de interrupção
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(BTN_EMERGENCIA, btn_emerg_isr_handler, NULL);
-    gpio_isr_handler_add(BTN_ANTIFURTO, btn_antifurto_isr_handler, NULL);
-
     gpio_set_direction(BUZZER, GPIO_MODE_OUTPUT);
 }
 
-// trata interrupção no botão de emergencia
-static void IRAM_ATTR btn_emerg_isr_handler(void *arg) {
-    estado_global = (estado_global == AWAIT) ? EMERGENCY_MODE : AWAIT;
+void botoes_task(void *arg) {
+    ESP_LOGI(TAG, "botoes task");
+    int last_emerg = 1;
+    int last_antifurto = 1;
+
+    while (1) {
+        int estado_emerg = gpio_get_level(BTN_EMERGENCIA);
+        int estado_antifurto = gpio_get_level(BTN_ANTIFURTO);
+
+        // Gestion bouton urgence
+        if (estado_emerg == 0) {
+            if (estado_global == AWAIT) {
+                ESP_LOGI(TAG, "Bouton urgence pressé, activation du mode urgence.");
+                estado_global = EMERGENCY_MODE;
+            } 
+                
+        } else if (estado_emerg == 1) {
+            if (estado_global == EMERGENCY_MODE) {
+                ESP_LOGI(TAG, "Bouton urgence relâché, désactivation du mode urgence.");
+                estado_global = AWAIT;
+            }
+        }
+
+        // Gestion bouton antifurto
+        if (estado_antifurto == 0) {
+            if (estado_global == AWAIT) {
+                ESP_LOGI(TAG, "Bouton antifurto pressé, activation du mode anti-furto.");
+                estado_global = ANTI_THEFT_MODE;
+            }
+        } else if (estado_antifurto ==1) {
+            if (estado_global == ANTI_THEFT_MODE || estado_global == ALARMING) {
+                ESP_LOGI(TAG, "Bouton antifurto pressé, desactivation du mode anti-furto.");
+                estado_global = AWAIT;
+            }}
+
+        vTaskDelay(pdMS_TO_TICKS(100)); // Antirebond + polling
+    }
 }
 
-// trata interrupção no botão de anti furto
-static void IRAM_ATTR btn_antifurto_isr_handler(void *arg) {
-   estado_global = (estado_global == AWAIT) ? ANTI_THEFT_MODE : AWAIT;
-}
 
 void antifurto_task(void *arg) {
     while (1) {
         if (estado_global == ANTI_THEFT_MODE) {
-            if (gpio_get_level(REED_SWITCH) == 0) { // Ouverture détectée
-                ESP_LOGW(TAG, "Ouverture détectée !");
-                send_sms("Alerte ouverture zipp !");
+            // Vérification ouverture (reed switch)
+            if (gpio_get_level(REED_SWITCH) == 0) {
+                ESP_LOGW(TAG, "Alerte : ouverture détectée !");
+                send_sms("Alerte : ouverture détectée sur le sac !");
                 buzzer_on();
                 estado_global = ALARMING;
+                continue;
             }
+            // Vérification du mouvement détecté par acelerometer_task
+            if (mouvement_detecte) {
+                ESP_LOGW(TAG, "Alerte : mouvement suspect détecté !");
+                send_sms("Alerte : mouvement suspect détecté !");
+                buzzer_on();
+                estado_global = ALARMING;
+                mouvement_detecte = false; // Reset après détection
+                continue;
+            }
+        } else if (estado_global == AWAIT) {
+            buzzer_off();
+            mouvement_detecte = false; // Remettre à zéro si on repasse à AWAIT
         }
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(CHECK_INTERVAL_MS));
     }
 }
 
 void emergencia_task(void *arg) {
+    TickType_t start_time = 0;
     while (1) {
         if (estado_global == EMERGENCY_MODE) {
+            start_time = xTaskGetTickCount();
             send_sms(gps_position);
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            ESP_LOGI(TAG, "SMS urgence envoyé avec position GPS.");
+            // Attendre 3 minutes (180000 ms)
+            vTaskDelay(pdMS_TO_TICKS(90000));
             buzzer_on();
-            vTaskDelay(pdMS_TO_TICKS(5000));
-            buzzer_off();
-            estado_global = ALARMING;
+            ESP_LOGI(TAG, "Buzzer activé en mode urgence.");
         }
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
-void  app_main(){
+void app_main() {
     i2c_master_init(); 
     ESP_LOGI(TAG, "i2c Master initialized");
     mpu6050_init();
-    mpu6050_calibrate(100);  // Calibrate IMU
+    mpu6050_calibrate(100);
     gps_init();
     gsm_init();
     botoes_init();
 
     xTaskCreate(gps_task, "gps_task", 4096, NULL, 5, NULL);
-    xTaskCreate(antifurto_task, "antifurto_task", 2048, NULL, 5, NULL);
-    xTaskCreate(emergencia_task, "emergencia_task", 2048, NULL, 5, NULL);
-    xTaskCreate(acelerometer_task, "acelerometer_task", 4096, NULL, 5, NULL); 
-    
+    xTaskCreate(botoes_task, "botoes_task", 2048, NULL, 5, NULL);
+    xTaskCreate(antifurto_task, "antifurto_task", 4096, NULL, 6, NULL);
+    xTaskCreate(emergencia_task, "emergencia_task", 2048, NULL, 7, NULL);
+    xTaskCreate(acelerometer_task, "acelerometer_task", 4096, NULL, 5, NULL); // Ajout de la tâche accéléromètre
+
     ESP_LOGI(TAG, "Système prêt");
 }
