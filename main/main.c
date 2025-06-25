@@ -79,6 +79,7 @@ float gyro_offset_x = 0, gyro_offset_y = 0, gyro_offset_z = 0; // Calibration of
 estado_global_t estado_global = AWAIT;
 char gps_position[100] = "Position inconnue";
 bool volatile mouvement_detecte = false; // Flag to indicate if movement is detected
+volatile bool gsm_network_registered = false;
 
 // Protótipos
 static void IRAM_ATTR btn_emerg_isr_handler(void *arg);
@@ -86,6 +87,32 @@ static void IRAM_ATTR btn_antifurto_isr_handler(void *arg);
 void send_sms(const char *message);
 void buzzer_on();
 void buzzer_off();
+
+void gsm_network_task(void *pvParameters) {
+    char buffer[128];
+    int len;
+
+    while (1) {
+        uart_write_bytes(GSM_UART, "AT+CREG?\r", 9);
+        len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(1000));
+        if (len > 0) {
+            buffer[len] = '\0';
+            ESP_LOGI("GSM", "CREG: %s", buffer);
+
+            if (strstr(buffer, "+CREG: 0,1") || strstr(buffer, "+CREG: 0,5")) {
+                gsm_network_registered = true;
+                ESP_LOGI("GSM", "Registrado na rede GSM!");
+            } else {
+                gsm_network_registered = false;
+                ESP_LOGW("GSM", "Ainda procurando rede...");
+            }
+        } else {
+            ESP_LOGW("GSM", "Sem resposta do módulo");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
 
 // Initialize I2C master for sensors
 void i2c_master_init() {
@@ -247,6 +274,7 @@ void gps_task(void *arg) {
 
     while (1) {
         int len = uart_read_bytes(GPS_UART_PORT, data, sizeof(data) - 1, pdMS_TO_TICKS(100));
+
         if (len > 0) {
             for (int i = 0; i < len; i++) {
                 char c = data[i];
@@ -255,7 +283,7 @@ void gps_task(void *arg) {
                     if (pos == 0) continue;  // ignora quebras duplicadas
 
                     line[pos] = '\0';  // finaliza a string
-                    ESP_LOGI(TAG, "NMEA: %s", line);
+                    //ESP_LOGI(TAG, "NMEA: %s", line);
 
                     // Verifica se é uma sentença GGA
                     if (minmea_sentence_id(line, false) == MINMEA_SENTENCE_GGA) {
@@ -296,29 +324,127 @@ void gsm_init() {
     uart_driver_install(GSM_UART, 2048, 0, 0, NULL, 0);
     uart_param_config(GSM_UART, &gsm_config);
     uart_set_pin(GSM_UART, GSM_TXD, GSM_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    char buffer[128];
+
+    // Testa comunicação básica com AT
+    for (int i = 0; i < 3; i++) {
+        uart_write_bytes(GSM_UART, "AT\r", 3);
+        int len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(1000));
+        if (len > 0) {
+            buffer[len] = '\0';
+            if (strstr(buffer, "OK")) {
+                ESP_LOGI("GSM", "Comunicação AT OK");
+                break;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    // Verifica o estado do chip SIM
+    uart_write_bytes(GSM_UART, "AT+CPIN?\r", 9);
+    int len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(1000));
+    if (len <= 0 || !strstr(buffer, "READY")) {
+        ESP_LOGE("GSM", "Chip SIM não pronto ou PIN ativo");
+        return;
+    }
+
+    // Tenta se registrar na rede por até 30 segundos
+    for (int i = 0; i < 15; i++) {
+        uart_write_bytes(GSM_UART, "AT+CREG?\r", 9);
+        len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(1000));
+        if (len > 0) {
+            buffer[len] = '\0';
+            ESP_LOGI("GSM", "CREG: %s", buffer);
+            if (strstr(buffer, "+CREG: 0,1") || strstr(buffer, "+CREG: 0,5")) {
+                ESP_LOGI("GSM", "Registrado na rede celular");
+                return;
+            }
+        }
+        ESP_LOGW("GSM", "Aguardando registro na rede (%d)...", i + 1);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    ESP_LOGE("GSM", "Falha ao registrar na rede após várias tentativas");
+    return;
 }
 
-// Function to send SMS using GSM module
+
+
+
+void gsm_read_response() {
+    uint8_t resp[128];
+    int len = uart_read_bytes(GSM_UART, resp, sizeof(resp) - 1, pdMS_TO_TICKS(1000));
+    if (len > 0) {
+        resp[len] = '\0';
+        ESP_LOGI("GSM", "Resposta: %s", (char *)resp);
+    } else {
+        ESP_LOGW("GSM", "Nenhuma resposta recebida");
+    }
+}
+
+
+bool gsm_wait_for_network() {
+    for (int i = 0; i < 10; i++) {
+        uart_write_bytes(GSM_UART, "AT+CREG?\r", 9);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        uint8_t resp[128] = {0};
+        int len = uart_read_bytes(GSM_UART, resp, sizeof(resp) - 1, pdMS_TO_TICKS(500));
+        if (len > 0) {
+            resp[len] = '\0';
+            ESP_LOGI("GSM", "CREG: %s", (char *)resp);
+            if (strstr((char *)resp, "+CREG: 0,1") || strstr((char *)resp, "+CREG: 0,5")) {
+                return true;
+            }
+        }
+    }
+    ESP_LOGE("GSM", "Falha ao registrar na rede");
+    return false;
+}
+
+bool gsm_wait_for_prompt() {
+    uint8_t resp[128] = {0};
+    int len = uart_read_bytes(GSM_UART, resp, sizeof(resp) - 1, pdMS_TO_TICKS(3000));
+    if (len > 0) {
+        resp[len] = '\0';
+        ESP_LOGI("GSM", "Prompt: %s", (char *)resp);
+        return strchr((char *)resp, '>') != NULL;
+    }
+    return false;
+}
+
 void send_sms(const char *message) {
-    const char *numero = TELEFONE_NUMBER;  // Ton numéro ici
+    const char *numero = TELEFONE_NUMBER;
     char cmd[100];
 
     uart_write_bytes(GSM_UART, "AT\r", 3);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    gsm_read_response();
 
-    snprintf(cmd, sizeof(cmd), "AT+CMGF=1\r");
-    uart_write_bytes(GSM_UART, cmd, strlen(cmd));
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    uart_write_bytes(GSM_UART, "AT+CSQ\r", 8);
+    gsm_read_response();
+
+    if (!gsm_wait_for_network()) {
+        ESP_LOGE("GSM", "Abortando envio de SMS - sem rede");
+        return;
+    }
+
+    uart_write_bytes(GSM_UART, "AT+CMGF=1\r", 10);
+    gsm_read_response();
 
     snprintf(cmd, sizeof(cmd), "AT+CMGS=%s\r", numero);
     uart_write_bytes(GSM_UART, cmd, strlen(cmd));
-    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    if (!gsm_wait_for_prompt()) {
+        ESP_LOGE("GSM", "Não recebeu o prompt '>' para envio de mensagem");
+        return;
+    }
 
     uart_write_bytes(GSM_UART, message, strlen(message));
-    uart_write_bytes(GSM_UART, "\x1A", 1);
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    uart_write_bytes(GSM_UART, "\x1A", 1);  // Ctrl+Z
+    gsm_read_response();
 
-    ESP_LOGI(TAG, "SMS envoyé : %s", message);
+    ESP_LOGI("GSM", "SMS enviado: %s", message);
 }
 
 void buzzer_on() {
@@ -387,18 +513,18 @@ void antifurto_task(void *arg) {
     while (1) {
         if (estado_global == ANTI_THEFT_MODE) {
             // Vérification ouverture (reed switch)
-            if (gpio_get_level(REED_SWITCH) == 0) {
+            if (gpio_get_level(REED_SWITCH) == 1) {
                 ESP_LOGW(TAG, "Alerte : ouverture détectée !");
-                send_sms("Alerte : ouverture détectée sur le sac !");
                 buzzer_on();
+                send_sms("Alerte : ouverture détectée !");
                 estado_global = ALARMING;
                 continue;
             }
             // Vérification du mouvement détecté par acelerometer_task
             if (mouvement_detecte) {
                 ESP_LOGW(TAG, "Alerte : mouvement suspect détecté !");
-                send_sms("Alerte : mouvement suspect détecté !");
                 buzzer_on();
+                send_sms("Alerte : mouvement suspect détecté !");
                 estado_global = ALARMING;
                 mouvement_detecte = false; // Reset après détection
                 continue;
@@ -419,13 +545,61 @@ void emergencia_task(void *arg) {
             send_sms(gps_position);
             ESP_LOGI(TAG, "SMS urgence envoyé avec position GPS.");
             // Attendre 3 minutes (180000 ms)
-            vTaskDelay(pdMS_TO_TICKS(90000));
+            vTaskDelay(pdMS_TO_TICKS(9000));
             buzzer_on();
             ESP_LOGI(TAG, "Buzzer activé en mode urgence.");
         }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
+
+void gsm_list_available_operators() {
+    char buffer[512];  // pode vir uma resposta grande!
+    ESP_LOGI("GSM", "Solicitando lista de operadoras...");
+
+    uart_write_bytes(GSM_UART, "AT+COPS=?\r", 10);
+
+    int len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(30000));  // até 30s
+    if (len > 0) {
+        buffer[len] = '\0';
+        ESP_LOGI("GSM", "Resposta COPS: %s", buffer);
+    } else {
+        ESP_LOGW("GSM", "Sem resposta do COPS (timeout)");
+    }
+}
+
+void gsm_check_signal() {
+    char buffer[128];
+    int len;
+
+    // Envia comando AT+CSQ
+    uart_write_bytes(GSM_UART, "AT+CSQ\r", 7);
+
+    // Lê resposta com timeout de 2 segundos
+    len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(2000));
+    if (len > 0) {
+        buffer[len] = '\0';
+        ESP_LOGI("GSM", "Resposta AT+CSQ: %s", buffer);
+
+        // Opcional: extrair o valor do sinal do buffer
+        int rssi = -1;
+        if (sscanf(buffer, "\r\n+CSQ: %d,", &rssi) == 1) {
+            ESP_LOGI("GSM", "Qualidade do sinal (RSSI): %d", rssi);
+            if (rssi == 99) {
+                ESP_LOGW("GSM", "Sinal desconhecido ou fora de alcance");
+            } else if (rssi >= 10) {
+                ESP_LOGI("GSM", "Sinal aceitável");
+            } else {
+                ESP_LOGW("GSM", "Sinal fraco");
+            }
+        } else {
+            ESP_LOGW("GSM", "Não conseguiu parsear o RSSI");
+        }
+    } else {
+        ESP_LOGW("GSM", "Timeout lendo resposta AT+CSQ");
+    }
+}
+
 
 void app_main() {
     i2c_master_init(); 
@@ -435,6 +609,10 @@ void app_main() {
     gps_init();
     gsm_init();
     botoes_init();
+    //uart_write_bytes(GSM_UART, "AT+COPS=1,2,\"72405\"\r", strlen("AT+COPS=1,2,\"72405\"\r"));
+    gsm_check_signal();
+    gsm_list_available_operators();
+    xTaskCreate(gsm_network_task, "GSM Network Monitor", 4096, NULL, 5, NULL);
 
     xTaskCreate(gps_task, "gps_task", 4096, NULL, 5, NULL);
     xTaskCreate(botoes_task, "botoes_task", 2048, NULL, 5, NULL);
