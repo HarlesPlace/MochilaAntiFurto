@@ -8,3 +8,6 @@ set(EXTRA_COMPONENT_DIRS components/minmea)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(MochilaAntifurto)
+target_add_binary_data(${CMAKE_PROJECT_NAME}.elf "main/client.crt" TEXT)
+target_add_binary_data(${CMAKE_PROJECT_NAME}.elf "main/client.key" TEXT)
+target_add_binary_data(${CMAKE_PROJECT_NAME}.elf "main/AmazonRootCA1.pem" TEXT)

@@ -11,6 +11,20 @@
 #include <math.h> // usar barra de matemática para cálculos matemáticos
 #include "driver/uart.h" // usar barra de uart para comunicação serial
 #include "minmea.h" // parser de GPS NMEA
+#include "mqtt_client.h" // usar barra de cliente MQTT para comunicação MQTT
+#include "nvs_flash.h" // usar barra de NVS para armazenamento não volátil
+#include "spi_flash_mmap.h" // usar barra de mapeamento de memória flash SPI para acessar a memória flash
+#include "esp_wifi.h" // usar barra de Wi-Fi para conectar-se a uma rede Wi-Fi
+#include "esp_event.h" 
+#include "esp_netif.h"
+#include "esp_netif_sntp.h"
+#include "esp_sntp.h"
+#include <cJSON.h>
+#include <lwip/sockets.h>
+#include <lwip/sys.h>
+#include <lwip/api.h>
+#include <lwip/netdb.h>
+#include "lwip/dns.h"
 
 // I2C pins
 #define I2C_SDA GPIO_NUM_21  // I2C SDA pin
@@ -49,8 +63,11 @@
 // Buzzer GPIO configuration
 #define BUZZER         GPIO_NUM_25
 
-// Phone number to send SMS
-#define TELEFONE_NUMBER "\"+5511939069320\""
+#define EXAMPLE_ESP_WIFI_SSID     "bobs"
+#define EXAMPLE_ESP_WIFI_PASS     "abacaxiamarelo"
+#define EXAMPLE_ESP_MAXIMUM_RETRY 5
+
+#define POSITION_TOPIC "MochilaAntifurto/Position"
 
 // Structure to hold IMU readings
 typedef struct {
@@ -79,38 +96,141 @@ float gyro_offset_x = 0, gyro_offset_y = 0, gyro_offset_z = 0; // Calibration of
 estado_global_t estado_global = AWAIT;
 char gps_position[100] = "Position inconnue";
 bool volatile mouvement_detecte = false; // Flag to indicate if movement is detected
-volatile bool gsm_network_registered = false;
+float last_latitude = 0.0f, last_longitude = 0.0f; // GPS coordinates
+int16_t last_longitude_int = 0, last_latitude_int = 0; // GPS coordinates as integers for NVS storage
+
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+static int s_retry_num = 0;
+
+extern const uint8_t client_cert_pem_start[] asm("_binary_client_crt_start");
+extern const uint8_t client_cert_pem_end[] asm("_binary_client_crt_end");
+extern const uint8_t client_key_pem_start[] asm("_binary_client_key_start");
+extern const uint8_t client_key_pem_end[] asm("_binary_client_key_end");
+extern const uint8_t server_cert_pem_start[] asm("_binary_AmazonRootCA1_pem_start");
+extern const uint8_t server_cert_pem_end[] asm("_binary_AmazonRootCA1_pem_end");
+
+esp_mqtt_client_handle_t client_mqtt;
 
 // Protótipos
 static void IRAM_ATTR btn_emerg_isr_handler(void *arg);
 static void IRAM_ATTR btn_antifurto_isr_handler(void *arg);
-void send_sms(const char *message);
 void buzzer_on();
 void buzzer_off();
+void publish_message_positon(const char *mensagem);
+void save_calibration(float latitude, float longitude);
 
-void gsm_network_task(void *pvParameters) {
-    char buffer[128];
-    int len;
+static void log_error_if_nonzero(const char *message, int error_code) {
+    if (error_code != 0) {
+        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
+    }
+}
 
-    while (1) {
-        uart_write_bytes(GSM_UART, "AT+CREG?\r", 9);
-        len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(1000));
-        if (len > 0) {
-            buffer[len] = '\0';
-            ESP_LOGI("GSM", "CREG: %s", buffer);
-
-            if (strstr(buffer, "+CREG: 0,1") || strstr(buffer, "+CREG: 0,5")) {
-                gsm_network_registered = true;
-                ESP_LOGI("GSM", "Registrado na rede GSM!");
-            } else {
-                gsm_network_registered = false;
-                ESP_LOGW("GSM", "Ainda procurando rede...");
-            }
+static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(TAG, "retry to connect to the AP");
         } else {
-            ESP_LOGW("GSM", "Sem resposta do módulo");
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
+        ESP_LOGI(TAG, "connect to the AP fail");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
+void connect_wifi(void) {
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = EXAMPLE_ESP_WIFI_SSID,
+            .password = EXAMPLE_ESP_WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "wifi_init_sta finished.");
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s", EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s", EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+    } else {
+        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+    }
+    vEventGroupDelete(s_wifi_event_group);
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+    ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32, base, event_id);
+    esp_mqtt_event_handle_t event = event_data;
+    esp_mqtt_client_handle_t client = event->client;
+    int msg_id;
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+            esp_mqtt_client_subscribe(client, "MochilaAntifurto", 0);
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+            break;
+        case MQTT_EVENT_SUBSCRIBED:
+            ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+            break;
+        case MQTT_EVENT_UNSUBSCRIBED:
+            ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+            break;
+        case MQTT_EVENT_PUBLISHED: // only for QoS 1 and 2
+            ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+            break;
+        case MQTT_EVENT_DATA:
+            ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+            printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+            printf("DATA=%.*s\r\n", event->data_len, event->data);
+
+            int lvalue = 0;
+
+            break;
+        case MQTT_EVENT_ERROR:
+            ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+            if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
+                log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
+                log_error_if_nonzero("captured as transport's socket errno", event->error_handle->esp_transport_sock_errno);
+                ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
+            }
+            break;
+        default:
+            ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+            break;
     }
 }
 
@@ -199,55 +319,56 @@ void acelerometer_task(void *arg) {
     int contador_leituras = 0;
     int contador_movimento = 0;
     while (1) {
-        imu_data = mpu6050_read();
+        if (estado_global == ANTI_THEFT_MODE) {
+            imu_data = mpu6050_read();
 
-        float acc_x = imu_data.acc_x;
-        float acc_y = imu_data.acc_y;
-        float acc_z = imu_data.acc_z;
+            float acc_x = imu_data.acc_x;
+            float acc_y = imu_data.acc_y;
+            float acc_z = imu_data.acc_z;
 
-        if (!first_reading) {
-            delta = sqrtf(
-                powf(acc_x - last_x, 2) +
-                powf(acc_y - last_y, 2) +
-                powf(acc_z - last_z, 2)
-            );
-        }
-
-        first_reading = false;
-
-        switch (estado) {
-            case EM_REPOUSO:
-                if (delta > DELTA_THRESHOLD) {
-                    estado = MONITORANDO_MOVIMENTO;
-                    contador_leituras = 1;
-                    contador_movimento = 1;
-                    ESP_LOGI(TAG, "Início de possível movimento (Δ=%.4f)", delta);
-                }
-                break;
-
-            case MONITORANDO_MOVIMENTO:
-                contador_leituras++;
-                if (delta > DELTA_THRESHOLD) {
-                    contador_movimento++;
-                }
-                if (contador_leituras >= TOTAL_LEITURAS) {
-                    float proporcao = (float)contador_movimento / contador_leituras;
-                    if (proporcao >= FRACAO_MINIMA_MOVIMENTO) {
-                        ESP_LOGW(TAG, "Movimento suspeito detectado! Δ (%d/%d)", contador_movimento, contador_leituras);
-                        mouvement_detecte = true;
-                    } else {
-                        ESP_LOGI(TAG, "Movimento descartado. Δ (%d/%d)", contador_movimento, contador_leituras);
-                        mouvement_detecte = false;
-                    }
-                    estado = EM_REPOUSO;
-                }
-                break;
+            if (!first_reading) {
+                delta = sqrtf(
+                    powf(acc_x - last_x, 2) +
+                    powf(acc_y - last_y, 2) +
+                    powf(acc_z - last_z, 2)
+                );
             }
-       
-        last_x = acc_x;
-        last_y = acc_y;
-        last_z = acc_z;
 
+            first_reading = false;
+
+            switch (estado) {
+                case EM_REPOUSO:
+                    if (delta > DELTA_THRESHOLD) {
+                        estado = MONITORANDO_MOVIMENTO;
+                        contador_leituras = 1;
+                        contador_movimento = 1;
+                        ESP_LOGI(TAG, "Início de possível movimento (Δ=%.4f)", delta);
+                    }
+                    break;
+
+                case MONITORANDO_MOVIMENTO:
+                    contador_leituras++;
+                    if (delta > DELTA_THRESHOLD) {
+                        contador_movimento++;
+                    }
+                    if (contador_leituras >= TOTAL_LEITURAS) {
+                        float proporcao = (float)contador_movimento / contador_leituras;
+                        if (proporcao >= FRACAO_MINIMA_MOVIMENTO) {
+                            ESP_LOGW(TAG, "Movimento suspeito detectado! Δ (%d/%d)", contador_movimento, contador_leituras);
+                            mouvement_detecte = true;
+                        } else {
+                            ESP_LOGI(TAG, "Movimento descartado. Δ (%d/%d)", contador_movimento, contador_leituras);
+                            mouvement_detecte = false;
+                        }
+                        estado = EM_REPOUSO;
+                    }
+                    break;
+                }
+        
+            last_x = acc_x;
+            last_y = acc_y;
+            last_z = acc_z;
+        }
         vTaskDelay(pdMS_TO_TICKS(CHECK_INTERVAL_MS));
     }
 }
@@ -292,6 +413,9 @@ void gps_task(void *arg) {
                             if (frame.fix_quality > 0) {
                                 float lat = minmea_tofloat(&frame.latitude);
                                 float lon = minmea_tofloat(&frame.longitude);
+                                last_latitude = lat;
+                                last_longitude = lon;
+                                save_calibration(last_latitude, last_longitude);
                                 ESP_LOGI(TAG, "Localização: Lat: %.5f, Lon: %.5f", lat, lon);
                             } else {
                                 ESP_LOGW(TAG, "Sem fix GPS (fix_quality = %d)", frame.fix_quality);
@@ -310,141 +434,6 @@ void gps_task(void *arg) {
         }
         vTaskDelay(pdMS_TO_TICKS(10));  // pequena pausa para cooperatividade
     }
-}
-
-void gsm_init() {
-    const uart_config_t gsm_config = {
-        .baud_rate = GSM_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
-    };
-
-    uart_driver_install(GSM_UART, 2048, 0, 0, NULL, 0);
-    uart_param_config(GSM_UART, &gsm_config);
-    uart_set_pin(GSM_UART, GSM_TXD, GSM_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    char buffer[128];
-
-    // Testa comunicação básica com AT
-    for (int i = 0; i < 3; i++) {
-        uart_write_bytes(GSM_UART, "AT\r", 3);
-        int len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(1000));
-        if (len > 0) {
-            buffer[len] = '\0';
-            if (strstr(buffer, "OK")) {
-                ESP_LOGI("GSM", "Comunicação AT OK");
-                break;
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-    // Verifica o estado do chip SIM
-    uart_write_bytes(GSM_UART, "AT+CPIN?\r", 9);
-    int len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(1000));
-    if (len <= 0 || !strstr(buffer, "READY")) {
-        ESP_LOGE("GSM", "Chip SIM não pronto ou PIN ativo");
-        return;
-    }
-
-    // Tenta se registrar na rede por até 30 segundos
-    for (int i = 0; i < 15; i++) {
-        uart_write_bytes(GSM_UART, "AT+CREG?\r", 9);
-        len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(1000));
-        if (len > 0) {
-            buffer[len] = '\0';
-            ESP_LOGI("GSM", "CREG: %s", buffer);
-            if (strstr(buffer, "+CREG: 0,1") || strstr(buffer, "+CREG: 0,5")) {
-                ESP_LOGI("GSM", "Registrado na rede celular");
-                return;
-            }
-        }
-        ESP_LOGW("GSM", "Aguardando registro na rede (%d)...", i + 1);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-
-    ESP_LOGE("GSM", "Falha ao registrar na rede após várias tentativas");
-    return;
-}
-
-
-
-
-void gsm_read_response() {
-    uint8_t resp[128];
-    int len = uart_read_bytes(GSM_UART, resp, sizeof(resp) - 1, pdMS_TO_TICKS(1000));
-    if (len > 0) {
-        resp[len] = '\0';
-        ESP_LOGI("GSM", "Resposta: %s", (char *)resp);
-    } else {
-        ESP_LOGW("GSM", "Nenhuma resposta recebida");
-    }
-}
-
-
-bool gsm_wait_for_network() {
-    for (int i = 0; i < 10; i++) {
-        uart_write_bytes(GSM_UART, "AT+CREG?\r", 9);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-
-        uint8_t resp[128] = {0};
-        int len = uart_read_bytes(GSM_UART, resp, sizeof(resp) - 1, pdMS_TO_TICKS(500));
-        if (len > 0) {
-            resp[len] = '\0';
-            ESP_LOGI("GSM", "CREG: %s", (char *)resp);
-            if (strstr((char *)resp, "+CREG: 0,1") || strstr((char *)resp, "+CREG: 0,5")) {
-                return true;
-            }
-        }
-    }
-    ESP_LOGE("GSM", "Falha ao registrar na rede");
-    return false;
-}
-
-bool gsm_wait_for_prompt() {
-    uint8_t resp[128] = {0};
-    int len = uart_read_bytes(GSM_UART, resp, sizeof(resp) - 1, pdMS_TO_TICKS(3000));
-    if (len > 0) {
-        resp[len] = '\0';
-        ESP_LOGI("GSM", "Prompt: %s", (char *)resp);
-        return strchr((char *)resp, '>') != NULL;
-    }
-    return false;
-}
-
-void send_sms(const char *message) {
-    const char *numero = TELEFONE_NUMBER;
-    char cmd[100];
-
-    uart_write_bytes(GSM_UART, "AT\r", 3);
-    gsm_read_response();
-
-    uart_write_bytes(GSM_UART, "AT+CSQ\r", 8);
-    gsm_read_response();
-
-    if (!gsm_wait_for_network()) {
-        ESP_LOGE("GSM", "Abortando envio de SMS - sem rede");
-        return;
-    }
-
-    uart_write_bytes(GSM_UART, "AT+CMGF=1\r", 10);
-    gsm_read_response();
-
-    snprintf(cmd, sizeof(cmd), "AT+CMGS=%s\r", numero);
-    uart_write_bytes(GSM_UART, cmd, strlen(cmd));
-
-    if (!gsm_wait_for_prompt()) {
-        ESP_LOGE("GSM", "Não recebeu o prompt '>' para envio de mensagem");
-        return;
-    }
-
-    uart_write_bytes(GSM_UART, message, strlen(message));
-    uart_write_bytes(GSM_UART, "\x1A", 1);  // Ctrl+Z
-    gsm_read_response();
-
-    ESP_LOGI("GSM", "SMS enviado: %s", message);
 }
 
 void buzzer_on() {
@@ -516,7 +505,7 @@ void antifurto_task(void *arg) {
             if (gpio_get_level(REED_SWITCH) == 1) {
                 ESP_LOGW(TAG, "Alerte : ouverture détectée !");
                 buzzer_on();
-                send_sms("Alerte : ouverture détectée !");
+                publish_message_positon("S0S - Abertura da Mochila detectada");
                 estado_global = ALARMING;
                 continue;
             }
@@ -524,7 +513,7 @@ void antifurto_task(void *arg) {
             if (mouvement_detecte) {
                 ESP_LOGW(TAG, "Alerte : mouvement suspect détecté !");
                 buzzer_on();
-                send_sms("Alerte : mouvement suspect détecté !");
+                publish_message_positon("S0S - Movimento suspeito detectado na Mochila");
                 estado_global = ALARMING;
                 mouvement_detecte = false; // Reset après détection
                 continue;
@@ -542,7 +531,7 @@ void emergencia_task(void *arg) {
     while (1) {
         if (estado_global == EMERGENCY_MODE) {
             start_time = xTaskGetTickCount();
-            send_sms(gps_position);
+            publish_message_positon("S0S - Estado de emergencia ativado");
             ESP_LOGI(TAG, "SMS urgence envoyé avec position GPS.");
             // Attendre 3 minutes (180000 ms)
             vTaskDelay(pdMS_TO_TICKS(9000));
@@ -553,71 +542,115 @@ void emergencia_task(void *arg) {
     }
 }
 
-void gsm_list_available_operators() {
-    char buffer[512];  // pode vir uma resposta grande!
-    ESP_LOGI("GSM", "Solicitando lista de operadoras...");
+static void mqtt_app_start(void) {
+    const esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = "mqtts://a2u5iulk6chw2o-ats.iot.us-east-1.amazonaws.com:8883",
+        .broker.verification.certificate = (const char *)server_cert_pem_start,
+        .credentials = {
+            .authentication = {
+                .certificate = (const char *)client_cert_pem_start,
+                .key = (const char *)client_key_pem_start,
+            },
+        }
+    };
 
-    uart_write_bytes(GSM_UART, "AT+COPS=?\r", 10);
+    ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+    client_mqtt = client;
+    /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
 
-    int len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(30000));  // até 30s
-    if (len > 0) {
-        buffer[len] = '\0';
-        ESP_LOGI("GSM", "Resposta COPS: %s", buffer);
-    } else {
-        ESP_LOGW("GSM", "Sem resposta do COPS (timeout)");
-    }
+    esp_mqtt_client_start(client);
+    ESP_LOGI(TAG, "after mqtt client start");
 }
 
-void gsm_check_signal() {
-    char buffer[128];
-    int len;
+void publish_message_positon(const char *mensagem) {
+    if (client_mqtt == NULL) return;
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "ID", "MochilaAntifurto - PMR");
+    cJSON_AddNumberToObject(root, "LATITUDE", last_latitude);
+    cJSON_AddNumberToObject(root, "LONGITUDE", last_longitude);
+    cJSON_AddStringToObject(root, "MENSAGEM", mensagem);
 
-    // Envia comando AT+CSQ
-    uart_write_bytes(GSM_UART, "AT+CSQ\r", 7);
+    char *json_str = cJSON_PrintUnformatted(root);
+    esp_mqtt_client_publish(client_mqtt, POSITION_TOPIC, json_str, strlen(json_str), 1, 0);
+    cJSON_Delete(root);
+    free(json_str);
+}
 
-    // Lê resposta com timeout de 2 segundos
-    len = uart_read_bytes(GSM_UART, (uint8_t *)buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(2000));
-    if (len > 0) {
-        buffer[len] = '\0';
-        ESP_LOGI("GSM", "Resposta AT+CSQ: %s", buffer);
-
-        // Opcional: extrair o valor do sinal do buffer
-        int rssi = -1;
-        if (sscanf(buffer, "\r\n+CSQ: %d,", &rssi) == 1) {
-            ESP_LOGI("GSM", "Qualidade do sinal (RSSI): %d", rssi);
-            if (rssi == 99) {
-                ESP_LOGW("GSM", "Sinal desconhecido ou fora de alcance");
-            } else if (rssi >= 10) {
-                ESP_LOGI("GSM", "Sinal aceitável");
-            } else {
-                ESP_LOGW("GSM", "Sinal fraco");
-            }
-        } else {
-            ESP_LOGW("GSM", "Não conseguiu parsear o RSSI");
-        }
-    } else {
-        ESP_LOGW("GSM", "Timeout lendo resposta AT+CSQ");
+void save_calibration(float latitude, float longitude) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("position_data", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE("NVS", "Erro ao abrir NVS: %s", esp_err_to_name(err));
+        return;
     }
+
+    nvs_set_i16(handle, "last_latitude", latitude*10000);
+    nvs_set_i16(handle, "last_longitude", longitude*10000);
+    nvs_set_u8(handle, "saved", 1);  // marcar como calibrado
+
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE("NVS", "Erro ao salvar ultimas coordenadas: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI("NVS", "Ultima localização salva com sucesso.");
+    }
+
+    nvs_close(handle);
+}
+
+bool load_calibration() {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("position_data", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW("NVS", "Erro ao abrir NVS: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    uint8_t calibrated = 0;
+    nvs_get_u8(handle, "saved", &calibrated);
+    if (calibrated != 1) {
+        ESP_LOGW("NVS", "Nenhuma calibração salva.");
+        nvs_close(handle);
+        return false;
+    }
+
+    nvs_get_i16(handle, "last_latitude", &last_latitude_int);
+    nvs_get_i16(handle, "last_longitude", &last_longitude_int);
+    last_latitude = last_latitude_int / 10000.0f; // Convertendo para float
+    last_longitude = last_longitude_int/ 10000.0f; // Convertendo para float
+    
+    nvs_close(handle);
+    return true;
 }
 
 
 void app_main() {
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    load_calibration();
+    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+    connect_wifi();
+    // Initialize MQTT
+    mqtt_app_start();
+
     i2c_master_init(); 
     ESP_LOGI(TAG, "i2c Master initialized");
     mpu6050_init();
     mpu6050_calibrate(100);
     gps_init();
-    gsm_init();
     botoes_init();
-    //uart_write_bytes(GSM_UART, "AT+COPS=1,2,\"72405\"\r", strlen("AT+COPS=1,2,\"72405\"\r"));
-    gsm_check_signal();
-    gsm_list_available_operators();
-    xTaskCreate(gsm_network_task, "GSM Network Monitor", 4096, NULL, 5, NULL);
 
     xTaskCreate(gps_task, "gps_task", 4096, NULL, 5, NULL);
     xTaskCreate(botoes_task, "botoes_task", 2048, NULL, 5, NULL);
     xTaskCreate(antifurto_task, "antifurto_task", 4096, NULL, 6, NULL);
-    xTaskCreate(emergencia_task, "emergencia_task", 2048, NULL, 7, NULL);
+    xTaskCreate(emergencia_task, "emergencia_task", 4096, NULL, 7, NULL);
     xTaskCreate(acelerometer_task, "acelerometer_task", 4096, NULL, 5, NULL); // Ajout de la tâche accéléromètre
 
     ESP_LOGI(TAG, "Système prêt");

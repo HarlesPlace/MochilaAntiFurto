@@ -3,3 +3,6 @@ sdkconfig
 sdkconfig.old
 .vscode/
 .devcontainer/
+AmazonRootCA1.pem
+client.crt
+client.key
